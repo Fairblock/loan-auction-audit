@@ -1,0 +1,751 @@
+// SPDX-License-Identifier
+pragma solidity >=0.8.19;
+
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
+import "./OfferManager.sol";
+import "./interface/IDecrypter.sol";
+import "./BidManager.sol";
+import "./AuctionToken.sol";
+import {UD60x18, ud} from "@prb/math/src/UD60x18.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+import {TokenScale} from "./lib/TokenScale.sol";
+import "@openzeppelin/contracts/utils/math/Math.sol";
+using TokenScale for uint256;
+using Math for uint256;
+
+/*
+ * @title AuctionEngine
+ * @dev This contract manages the auction process including revealing bids and offers, finalizing, assigning the bids and offers, and repayments.
+ */
+contract AuctionEngine is ReentrancyGuard, Ownable {
+    using SafeERC20 for IERC20;
+    struct DecodedBid {
+        address bidder;
+        uint256 quantity;
+        UD60x18 rate;
+    }
+    struct DecodedOffer {
+        address offerer;
+        uint256 quantity;
+        UD60x18 rate;
+    }
+
+    OfferManager public offerManager;
+    IDecrypter public decrypter;
+    string public auctionID;
+    AuctionToken public auctionToken;
+    BidManager public bidManager;
+
+    UD60x18 public auctionClearingRate;
+    uint256 public endTimestamp;
+    bool public isFinalized;
+    bool public auctionCancelled;
+    uint256 public auctionVolume;
+    uint256 public auctionTokenAmount;
+    uint256 public biddingStart;
+    uint256 public biddingEnd;
+    uint256 public revealEnd;
+    uint256 public repaymentDue;
+    uint256 public totalRepayed;
+    bool public paused;
+    bool public allBidsDecrypted;
+    bool public allOffersDecrypted;
+
+    UD60x18 public fraction;
+    uint256 public fee;
+    uint256 public liquidationFee;
+    uint256 public protocolLiquidationFee;
+    uint256 public maxBids = 100;
+    uint256 public maxOffers = 100;
+
+    UD60x18 public constant maxAllowedRate = UD60x18.wrap(20_000e18);
+
+    DecodedBid[] public bidsRevealed;
+    DecodedOffer[] public offersRevealed;
+    uint256 public bidsDecrypted;
+    uint256 public offersDecrypted;
+
+    mapping(address => uint256) public finalBidAllocation;
+    mapping(address => uint256) public finalOfferAllocation;
+    mapping(address => uint256) public repayments;
+    uint256 public repaymentTotal;
+    IERC20 public immutable repaymentToken;
+    uint8 public immutable repaymentDecimals;
+
+    event AuctionFinalized(uint256 clearingRate, uint256 clearedVolume);
+    event AuctionCancelled(string reason);
+    event AuctionPaused();
+    event AuctionUnpaused();
+
+    modifier whenNotPaused() {
+        require(!paused, "Auction is paused");
+        _;
+    }
+    modifier onlyAuctionToken() {
+        require(msg.sender == address(auctionToken), "Not auction token");
+        _;
+    }
+
+    constructor(
+        address _decrypter,
+        uint256 _biddingDuration,
+        uint256 _revealDuration,
+        uint256 _loanDuration,
+        string memory _id,
+        address _token,
+        uint256 _fee,
+        uint256 _liquidationFee,
+        uint256 _protocolLiquidationfee,
+        address _auctionToken,
+        uint256 _auctionTokenAmount
+    ) Ownable(msg.sender) {
+        require(_decrypter != address(0), "Zero address");
+        require(_token != address(0), "Zero address");
+        decrypter = IDecrypter(_decrypter);
+        biddingStart = block.timestamp;
+        biddingEnd = biddingStart + _biddingDuration;
+        revealEnd = biddingEnd + _revealDuration;
+        repaymentDue = revealEnd + _loanDuration;
+
+        fraction = ud((_loanDuration * 1e18) / 31_104_000);
+        auctionToken = AuctionToken(_auctionToken);
+        endTimestamp = revealEnd;
+        auctionID = _id;
+        auctionTokenAmount = _auctionTokenAmount;
+        fee = _fee;
+        liquidationFee = _liquidationFee;
+        protocolLiquidationFee = _protocolLiquidationfee;
+
+        repaymentToken = IERC20(_token);
+        repaymentDecimals = IERC20Metadata(_token).decimals();
+    }
+
+    // Set bid and offer managers
+    function setManagers(
+        address _bidManager,
+        address _offerManager
+    ) external onlyOwner {
+        require(
+            _bidManager != address(0) && _offerManager != address(0),
+            "Zero address"
+        );
+        bidManager = BidManager(_bidManager);
+        offerManager = OfferManager(_offerManager);
+    }
+
+    function pauseAuction() external onlyOwner {
+        paused = true;
+        emit AuctionPaused();
+    }
+
+    function unpauseAuction() external onlyOwner {
+        paused = false;
+        emit AuctionUnpaused();
+    }
+
+    // Decrypt bids. Batch size should be chosen according to the decryption gas consumption. On Arbitrum, the maximum batch size is 3.
+    function decryptBidsBatch(
+        uint256 batchSize,
+        uint8[] calldata decryptionKey
+    ) external onlyOwner whenNotPaused {
+        require(!allBidsDecrypted, "All bids decrypted");
+        BidManager.EncryptedBid[] memory encBids = bidManager.getBids();
+        uint256 n = encBids.length;
+        if (n == 0) {
+            allBidsDecrypted = true;
+            return;
+        }
+        uint256 processed;
+        for (uint256 i = bidsDecrypted; i < n && processed < batchSize; ++i) {
+            if (encBids[i].submitter == address(0)) {
+                bidsDecrypted++;
+                processed++;
+                continue;
+            }
+            uint8[] memory out = decrypter.decrypt(
+                _toUint8Array(encBids[i].encryptedRate),
+                decryptionKey
+            );
+            bool valid = true;
+            for (uint256 k; k < out.length; ++k) {
+                if (out[k] < 48 || out[k] > 57) {
+                    valid = false;
+                    break;
+                }
+            }
+            if (!valid) {
+                bidsDecrypted++;
+                processed++;
+                bidManager.unlockCollateral(encBids[i].submitter);
+                continue;
+            }
+            uint256 rawRate = _uint8ArrayToUint256(out);
+            UD60x18 rate = ud(rawRate * 1e18);
+            if (rate.gt(maxAllowedRate)) {
+                bidsDecrypted++;
+                processed++;
+                continue;
+            }
+            bidsRevealed.push(
+                DecodedBid(encBids[i].submitter, encBids[i].quantity, rate)
+            );
+            bidsDecrypted++;
+            processed++;
+        }
+        if (bidsDecrypted == n) allBidsDecrypted = true;
+    }
+
+    // Decrypt offer. Batch size should be chosen according to the decryption gas consumption. On Arbitrum, the maximum batch size is 3.
+    function decryptOffersBatch(
+        uint256 batchSize,
+        uint8[] calldata decryptionKey
+    ) external onlyOwner whenNotPaused {
+        require(!allOffersDecrypted, "All offers decrypted");
+        OfferManager.EncryptedOffer[] memory encOffers = offerManager
+            .getOffers();
+        uint256 n = encOffers.length;
+        if (n == 0) {
+            allOffersDecrypted = true;
+            return;
+        }
+        uint256 processed;
+        for (uint256 i = offersDecrypted; i < n && processed < batchSize; ++i) {
+            if (encOffers[i].submitter == address(0)) {
+                offersDecrypted++;
+                continue;
+            }
+            uint8[] memory out = decrypter.decrypt(
+                _toUint8Array(encOffers[i].encryptedRate),
+                decryptionKey
+            );
+            bool valid = true;
+            for (uint256 k; k < out.length; ++k) {
+                if (out[k] < 48 || out[k] > 57) {
+                    valid = false;
+                    break;
+                }
+            }
+            if (!valid) {
+                offersDecrypted++;
+                processed++;
+                offerManager.unlockFunds(
+                    encOffers[i].submitter,
+                    encOffers[i].quantity
+                );
+                continue;
+            }
+            uint256 rawRate = _uint8ArrayToUint256(out);
+            UD60x18 rate = ud(rawRate * 1e18);
+            if (rate.gt(maxAllowedRate)) {
+                offersDecrypted++;
+                processed++;
+                continue;
+            }
+            offersRevealed.push(
+                DecodedOffer(
+                    encOffers[i].submitter,
+                    encOffers[i].quantity,
+                    rate
+                )
+            );
+            offersDecrypted++;
+            processed++;
+        }
+        if (offersDecrypted == n) allOffersDecrypted = true;
+    }
+
+    // Finalize auction, calculate the clearing price, and assign bids and offers
+    function finalizeAuction() external onlyOwner whenNotPaused nonReentrant {
+        require(!isFinalized, "Already finalized");
+        require(!auctionCancelled, "Auction cancelled");
+        require(allBidsDecrypted, "Not all bids decrypted");
+        require(allOffersDecrypted, "Not all offers decrypted");
+        require(bidsRevealed.length <= maxBids, "Exceeded max bids allowed");
+        require(
+            offersRevealed.length <= maxOffers,
+            "Exceeded max offers allowed"
+        );
+        // require(
+        //     getAuctionPhase() == AuctionPhase.Reveal,
+        //     "Auction not in reveal phase"
+        // );
+
+        _sortBids();
+        _sortOffers();
+
+        (UD60x18 clrPrice, uint256 clearedVolume) = _calculateClearingPrice();
+        auctionClearingRate = clrPrice;
+        auctionVolume = clearedVolume;
+
+        _assignBids(clrPrice, clearedVolume);
+        _assignOffers(clrPrice, clearedVolume);
+
+        isFinalized = true;
+        emit AuctionFinalized(UD60x18.unwrap(clrPrice), clearedVolume);
+    }
+
+    // Cancel the auction and return the locked funds and collaterals
+    function cancelAuction(
+        string calldata reason
+    ) external onlyOwner nonReentrant {
+        require(!isFinalized, "Already finalized");
+        require(!auctionCancelled, "Already cancelled");
+        require(block.timestamp < biddingEnd, "Already finished");
+        auctionCancelled = true;
+        offerManager.unlockAllOffers();
+        bidManager.unlockAllBids();
+        emit AuctionCancelled(reason);
+    }
+
+    // Repay by borrower during the repayment period
+    function repay(uint256 amountRaw) external nonReentrant whenNotPaused {
+        uint256 owed = repayments[msg.sender];
+        require(owed > 0 && amountRaw <= owed, "invalid amount");
+        // require(
+        //     getAuctionPhase() == AuctionPhase.Repayment,
+        //     "Not in repayment phase"
+        // );
+        repayments[msg.sender] = owed - amountRaw;
+        repaymentTotal -= amountRaw;
+        totalRepayed += amountRaw;
+        repaymentToken.safeTransferFrom(
+            msg.sender,
+            address(offerManager.lendingVault()),
+            amountRaw
+        );
+        if (repayments[msg.sender] == 0)
+            bidManager.unlockCollateral(msg.sender);
+    }
+
+    // Repay function with auction token instead of purchase token
+    function repayWithAuctionToken(
+        uint256 auctionAmount
+    ) external nonReentrant whenNotPaused {
+        uint256 owed = repayments[msg.sender];
+        require(owed > 0, "Nothing owed");
+        require(
+            getAuctionPhase() == AuctionPhase.Repayment ||
+                getAuctionPhase() == AuctionPhase.LoanWindow,
+            "Not in correct phase"
+        );
+
+        uint256 repayRaw = auctionAmount.mulDiv(auctionTokenAmount, 1e18);
+        require(repayRaw <= owed, "Repay exceeds debt");
+
+        auctionToken.burn(msg.sender, auctionAmount);
+
+        repayments[msg.sender] -= repayRaw;
+        repaymentTotal -= repayRaw;
+        totalRepayed += repayRaw;
+
+        if (repayments[msg.sender] == 0) {
+            bidManager.unlockCollateral(msg.sender);
+        }
+    }
+
+    // Liquidation of borrower's collateral in case of short fall
+    function batchEarlyLiquidation(
+        address participant,
+        address[] calldata collateralTokens,
+        uint256[] calldata coverageAmounts
+    ) external nonReentrant whenNotPaused {
+        require(
+            block.timestamp < repaymentDue + 172_800,
+            "Use batchLateLiquidation"
+        );
+        require(
+            collateralTokens.length == coverageAmounts.length,
+            "Array mismatch"
+        );
+        require(msg.sender != participant, "Self liquidation not allowed!");
+
+        uint256 owed = repayments[participant];
+        require(owed > 0, "No debt");
+        // require(
+        //     bidManager.isInShortFall(participant, owed),
+        //     "Not undercollateralized"
+        // );
+
+        uint256 totalCoverage;
+        for (uint256 i; i < coverageAmounts.length; ++i)
+            totalCoverage += coverageAmounts[i];
+        require(totalCoverage <= owed, "Exceeds debt");
+
+        repayments[participant] = owed - totalCoverage;
+        repaymentTotal -= totalCoverage;
+
+        repaymentToken.safeTransferFrom(
+            msg.sender,
+            address(offerManager.lendingVault()),
+            totalCoverage
+        );
+        for (uint256 i; i < coverageAmounts.length; ++i) {
+            (uint256 seized, uint256 seizedFee) = bidManager
+                .calculateEquivalentAmount(
+                    coverageAmounts[i],
+                    collateralTokens[i],
+                    liquidationFee,
+                    protocolLiquidationFee
+                );
+            bidManager.transferCollateral(
+                participant,
+                msg.sender,
+                collateralTokens[i],
+                seized,
+                seizedFee
+            );
+        }
+    }
+
+    // Liquidation of borrower's collaterals in case of missed repayment
+    function batchLateLiquidation(
+        address participant,
+        address[] calldata collateralTokens,
+        uint256[] calldata coverageAmounts
+    ) external nonReentrant whenNotPaused {
+        require(
+            block.timestamp >= repaymentDue + 172_800,
+            "Use batchEarlyLiquidation"
+        );
+        require(
+            collateralTokens.length == coverageAmounts.length,
+            "Array mismatch"
+        );
+        require(msg.sender != participant, "Self liquidation not allowed!");
+        uint256 owed = repayments[participant];
+        require(owed > 0, "No debt");
+
+        uint256 totalCoverage;
+        for (uint256 i; i < coverageAmounts.length; ++i)
+            totalCoverage += coverageAmounts[i];
+        require(totalCoverage <= owed, "Exceeds debt");
+
+        repayments[participant] = owed - totalCoverage;
+        repaymentTotal -= totalCoverage;
+        
+        repaymentToken.safeTransferFrom(
+            msg.sender,
+            address(offerManager.lendingVault()),
+            totalCoverage
+        );
+
+        for (uint256 i; i < coverageAmounts.length; ++i) {
+            (uint256 seized, uint256 seizedFee) = bidManager
+                .calculateEquivalentAmount(
+                    coverageAmounts[i],
+                    collateralTokens[i],
+                    liquidationFee,
+                    protocolLiquidationFee
+                );
+            bidManager.transferCollateral(
+                participant,
+                msg.sender,
+                collateralTokens[i],
+                seized,
+                seizedFee
+            );
+        }
+    }
+
+    // Redeem auction token to receive purchase token
+    function auctionTokenRedeem(
+        address to,
+        uint256 auctionAmount
+    ) external onlyAuctionToken whenNotPaused {
+        uint256 payoutRaw = auctionAmount.mulDiv(auctionTokenAmount, 1e18);
+        offerManager.transferFunds(to, payoutRaw);
+    }
+
+    function bidsRevealedLength() external view returns (uint256) {
+        return bidsRevealed.length;
+    }
+
+    function offersRevealedLength() external view returns (uint256) {
+        return offersRevealed.length;
+    }
+
+    enum AuctionPhase {
+        Bidding,
+        Reveal,
+        Repayment,
+        Redemption,
+        LoanWindow
+    }
+
+    function getAuctionPhase() public view returns (AuctionPhase) {
+        if (block.timestamp >= biddingStart && block.timestamp < biddingEnd)
+            return AuctionPhase.Bidding;
+        if (block.timestamp >= biddingEnd && block.timestamp < revealEnd)
+            return AuctionPhase.Reveal;
+        if (block.timestamp >= revealEnd && block.timestamp <= repaymentDue)
+            return AuctionPhase.LoanWindow;
+        if (
+            block.timestamp >= repaymentDue &&
+            block.timestamp < repaymentDue + 172_800
+        ) return AuctionPhase.Repayment;
+        if (block.timestamp >= repaymentDue + 172_800)
+            return AuctionPhase.Redemption;
+        revert("Auction phase undefined");
+    }
+
+    // Internal sorting of bids from highest to lowest
+    function _sortBids() internal {
+        uint256 n = bidsRevealed.length;
+        for (uint256 i; i < n; ++i)
+            for (uint256 j; j < n - 1 - i; ++j)
+                if (bidsRevealed[j].rate.lt(bidsRevealed[j + 1].rate)) {
+                    DecodedBid memory tmp = bidsRevealed[j];
+                    bidsRevealed[j] = bidsRevealed[j + 1];
+                    bidsRevealed[j + 1] = tmp;
+                }
+    }
+
+    // Internal sorting of offers from lowest to highest
+    function _sortOffers() internal {
+        uint256 n = offersRevealed.length;
+        for (uint256 i; i < n; ++i)
+            for (uint256 j; j < n - 1 - i; ++j)
+                if (offersRevealed[j].rate.gt(offersRevealed[j + 1].rate)) {
+                    DecodedOffer memory tmp = offersRevealed[j];
+                    offersRevealed[j] = offersRevealed[j + 1];
+                    offersRevealed[j + 1] = tmp;
+                }
+    }
+
+    // Calculating the clearing price
+    function _calculateClearingPrice()
+        internal
+        view
+        returns (UD60x18, uint256)
+    {
+        uint256 accumSupply;
+        uint256 bestVolume;
+        UD60x18 pivotOfferRate;
+        for (uint256 i; i < offersRevealed.length; ) {
+            UD60x18 currentRate = offersRevealed[i].rate;
+            uint256 sumOffers;
+            while (
+                i < offersRevealed.length &&
+                offersRevealed[i].rate.eq(currentRate)
+            ) {
+                sumOffers += offersRevealed[i].quantity;
+                ++i;
+            }
+            accumSupply += sumOffers;
+
+            uint256 demand;
+            for (uint256 j; j < bidsRevealed.length; ++j) {
+                if (bidsRevealed[j].rate.gte(currentRate))
+                    demand += bidsRevealed[j].quantity;
+                else break;
+            }
+            uint256 volume = accumSupply < demand ? accumSupply : demand;
+            if (volume > bestVolume) {
+                bestVolume = volume;
+                pivotOfferRate = currentRate;
+            }
+        }
+
+        uint256 marginalBidIndex;
+        for (uint256 j; j < bidsRevealed.length; ++j) {
+            if (bidsRevealed[j].rate.gte(pivotOfferRate)) marginalBidIndex = j;
+            else break;
+        }
+        UD60x18 clearingBidRate = bidsRevealed[marginalBidIndex].rate;
+        UD60x18 clearingOfferRate = pivotOfferRate;
+        UD60x18 finalRate = (clearingBidRate + clearingOfferRate) / ud(2e18);
+
+        uint256 finalDemand;
+        for (uint256 m; m < bidsRevealed.length; ++m) {
+            if (bidsRevealed[m].rate.gte(finalRate))
+                finalDemand += bidsRevealed[m].quantity;
+            else break;
+        }
+        uint256 finalSupply;
+        for (uint256 n; n < offersRevealed.length; ++n) {
+            if (offersRevealed[n].rate.lte(finalRate))
+                finalSupply += offersRevealed[n].quantity;
+            else break;
+        }
+        uint256 finalVolume = finalDemand < finalSupply
+            ? finalDemand
+            : finalSupply;
+        return (finalRate, finalVolume);
+    }
+
+    // Assigning offers to bidders
+    function _assignBids(UD60x18 clearingRate, uint256 totalCleared) internal {
+        uint256 rem = totalCleared;
+        uint256 len = bidsRevealed.length;
+        for (uint256 i; i < len && rem > 0; ) {
+            if (bidsRevealed[i].rate.lt(clearingRate)) break;
+            uint256 j = i + 1;
+            while (j < len && bidsRevealed[j].rate.eq(bidsRevealed[i].rate))
+                ++j;
+
+            uint256 sumQty;
+            for (uint256 k = i; k < j; ++k) sumQty += bidsRevealed[k].quantity;
+
+            if (sumQty <= rem) {
+                for (uint256 k = i; k < j; ++k) {
+                    uint256 q = bidsRevealed[k].quantity;
+                    finalBidAllocation[bidsRevealed[k].bidder] = q;
+                    _finalizeBidAssignment(
+                        bidsRevealed[k].bidder,
+                        q,
+                        clearingRate
+                    );
+                    rem -= q;
+                }
+            } else {
+                uint256 left = rem;
+                for (uint256 k = i; k < j; ++k) {
+                    uint256 q = bidsRevealed[k].quantity;
+                    uint256 alloc = (k < j - 1) ? (left * q) / sumQty : left;
+                    finalBidAllocation[bidsRevealed[k].bidder] = alloc;
+                    _finalizeBidAssignment(
+                        bidsRevealed[k].bidder,
+                        alloc,
+                        clearingRate
+                    );
+                    if (k < j - 1) {
+                        left -= alloc;
+                        sumQty -= q;
+                    }
+                }
+                rem = 0;
+            }
+            i = j;
+        }
+        for (uint256 m; m < len; ++m) {
+            address bidder = bidsRevealed[m].bidder;
+            if (finalBidAllocation[bidder] == 0)
+                bidManager.unlockCollateral(bidder);
+        }
+    }
+
+    // Assigning bids to offerers
+    function _assignOffers(
+        UD60x18 clearingRate,
+        uint256 totalCleared
+    ) internal {
+        uint256 rem = totalCleared;
+        uint256 len = offersRevealed.length;
+        for (uint256 i; i < len && rem > 0; ) {
+            if (offersRevealed[i].rate.gt(clearingRate)) break;
+            uint256 j = i + 1;
+            while (j < len && offersRevealed[j].rate.eq(offersRevealed[i].rate))
+                ++j;
+
+            uint256 sumQty;
+            for (uint256 k = i; k < j; ++k)
+                sumQty += offersRevealed[k].quantity;
+
+            if (sumQty <= rem) {
+                for (uint256 k = i; k < j; ++k) {
+                    uint256 q = offersRevealed[k].quantity;
+                    finalOfferAllocation[offersRevealed[k].offerer] = q;
+                    _finalizeOfferAssignment(
+                        offersRevealed[k].offerer,
+                        q,
+                        offersRevealed[k].quantity,
+                        clearingRate
+                    );
+                    rem -= q;
+                }
+            } else {
+                uint256 left = rem;
+                for (uint256 k = i; k < j; ++k) {
+                    uint256 q = offersRevealed[k].quantity;
+                    uint256 alloc = (k < j - 1) ? (left * q) / sumQty : left;
+                    finalOfferAllocation[offersRevealed[k].offerer] = alloc;
+                    _finalizeOfferAssignment(
+                        offersRevealed[k].offerer,
+                        alloc,
+                        offersRevealed[k].quantity,
+                        clearingRate
+                    );
+                    if (k < j - 1) {
+                        left -= alloc;
+                        sumQty -= q;
+                    }
+                }
+                rem = 0;
+            }
+            i = j;
+        }
+        for (uint256 m; m < len; ++m) {
+            address off = offersRevealed[m].offerer;
+            if (finalOfferAllocation[off] == 0)
+                offerManager.unlockFunds(off, offersRevealed[m].quantity);
+        }
+    }
+
+    function _finalizeBidAssignment(
+        address bidder,
+        uint256 quantityToken,
+        UD60x18 clearingRate
+    ) internal {
+        UD60x18 scaledFactor = ud(100e18) + fraction.mul(clearingRate);
+        UD60x18 repayFixedWad = ud(_to18(quantityToken)).mul(scaledFactor) /
+            ud(100e18);
+
+        uint256 repayWad = UD60x18.unwrap(repayFixedWad);
+        uint256 repayRaw = repayWad.from18(repaymentDecimals);
+
+        repayments[bidder] += repayRaw;
+        repaymentTotal += repayRaw;
+
+        uint256 annualInterestRaw = Math.mulDiv(quantityToken, fee, 1e18);
+
+        uint256 fractionWad = UD60x18.unwrap(fraction);
+        uint256 feeRaw = Math.mulDiv(annualInterestRaw, fractionWad, 1e18);
+
+        offerManager.transferFunds(owner(), feeRaw);
+        offerManager.transferFunds(bidder, quantityToken - feeRaw);
+    }
+
+    function _finalizeOfferAssignment(
+        address offerer,
+        uint256 quantityToken,
+        uint256 offerAmountToken,
+        UD60x18 rate
+    ) internal {
+        UD60x18 scaledFactor = ud(100e18) + fraction.mul(rate);
+
+        UD60x18 repayFixedWad = ud(_to18(quantityToken)).mul(scaledFactor) /
+            ud(100e18);
+
+        uint256 repayWad = UD60x18.unwrap(repayFixedWad);
+        uint256 repayRaw = repayWad.from18(repaymentDecimals);
+
+        offerManager.unlockFunds(offerer, offerAmountToken - quantityToken);
+
+        uint256 mintRaw = Math.mulDiv(repayRaw, 1e18, auctionTokenAmount);
+
+        auctionToken.mintForOffer(offerer, mintRaw);
+    }
+
+    function _to18(uint256 raw) internal view returns (uint256) {
+        return raw.to18(repaymentDecimals);
+    }
+
+    function _toUint8Array(
+        bytes memory data
+    ) internal pure returns (uint8[] memory) {
+        uint8[] memory arr = new uint8[](data.length);
+        for (uint256 i; i < data.length; ++i) arr[i] = uint8(data[i]);
+        return arr;
+    }
+
+    function _uint8ArrayToUint256(
+        uint8[] memory arr
+    ) internal pure returns (uint256 result) {
+        for (uint256 i; i < arr.length; ++i) {
+            require(arr[i] >= 48 && arr[i] <= 57, "Non-numeric");
+            result = result * 10 + (arr[i] - 48);
+        }
+    }
+}
