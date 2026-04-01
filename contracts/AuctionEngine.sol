@@ -282,7 +282,15 @@ contract AuctionEngine is ReentrancyGuard, Ownable {
         //     getAuctionPhase() == AuctionPhase.Reveal,
         //     "Auction not in reveal phase"
         // );
-
+        if (bidsRevealed.length == 0 || offersRevealed.length == 0) {
+            auctionClearingRate = ud(0);
+            auctionVolume = 0;
+            _assignBids(ud(0), 0);
+            _assignOffers(ud(0), 0);
+            isFinalized = true;
+            emit AuctionFinalized(0, 0);
+            return;
+        }
         _sortBids();
         _sortOffers();
 
@@ -314,10 +322,11 @@ contract AuctionEngine is ReentrancyGuard, Ownable {
     function repay(uint256 amountRaw) external nonReentrant whenNotPaused {
         uint256 owed = repayments[msg.sender];
         require(owed > 0 && amountRaw <= owed, "invalid amount");
-        // require(
-        //     getAuctionPhase() == AuctionPhase.Repayment,
-        //     "Not in repayment phase"
-        // );
+        require(
+            getAuctionPhase() == AuctionPhase.Repayment ||
+                getAuctionPhase() == AuctionPhase.LoanWindow,
+            "Not in correct phase"
+        );
         repayments[msg.sender] = owed - amountRaw;
         repaymentTotal -= amountRaw;
         totalRepayed += amountRaw;
@@ -549,6 +558,10 @@ contract AuctionEngine is ReentrancyGuard, Ownable {
         view
         returns (UD60x18, uint256)
     {
+        if (bidsRevealed.length == 0 || offersRevealed.length == 0) {
+            return (ud(0), 0);
+        }
+
         uint256 accumSupply;
         uint256 bestVolume;
         UD60x18 pivotOfferRate;
@@ -577,31 +590,99 @@ contract AuctionEngine is ReentrancyGuard, Ownable {
             }
         }
 
-        uint256 marginalBidIndex;
-        for (uint256 j; j < bidsRevealed.length; ++j) {
-            if (bidsRevealed[j].rate.gte(pivotOfferRate)) marginalBidIndex = j;
-            else break;
+        if (bestVolume == 0) {
+            return (ud(0), 0);
         }
-        UD60x18 clearingBidRate = bidsRevealed[marginalBidIndex].rate;
-        UD60x18 clearingOfferRate = pivotOfferRate;
-        UD60x18 finalRate = (clearingBidRate + clearingOfferRate) / ud(2e18);
 
-        uint256 finalDemand;
-        for (uint256 m; m < bidsRevealed.length; ++m) {
-            if (bidsRevealed[m].rate.gte(finalRate))
-                finalDemand += bidsRevealed[m].quantity;
-            else break;
+        // Price formation: matchedMarginalBidRate comes from the last bid that receives a
+        // positive fill when simulating top-down allocation of bestVolume (discrete max volume).
+        // Dust bids at or above the pivot but with zero fill cannot set the marginal rate.
+        uint256 remainingVolume = bestVolume;
+        uint256 actualMarginalBidIndex;
+        for (uint256 i; i < bidsRevealed.length && remainingVolume > 0; ++i) {
+            uint256 q = bidsRevealed[i].quantity;
+            uint256 fillable = q < remainingVolume ? q : remainingVolume;
+            if (fillable > 0) {
+                actualMarginalBidIndex = i;
+                remainingVolume -= fillable;
+            }
         }
-        uint256 finalSupply;
-        for (uint256 n; n < offersRevealed.length; ++n) {
-            if (offersRevealed[n].rate.lte(finalRate))
-                finalSupply += offersRevealed[n].quantity;
-            else break;
+
+        UD60x18 matchedMarginalBidRate = bidsRevealed[actualMarginalBidIndex].rate;
+        UD60x18 finalRate = (matchedMarginalBidRate + pivotOfferRate) / ud(2e18);
+
+        return (finalRate, bestVolume);
+    }
+
+    /// @dev Hamilton (largest-remainder) apportionment: proportional floor shares, then +1 to top
+    ///      fractional remainders; ties broken by address (deterministic, order-neutral).
+    function _allocateLargestRemainder(
+        uint256 rem,
+        uint256 i,
+        uint256 j,
+        uint256 sumQty,
+        UD60x18 clearingRate,
+        bool forBids
+    ) internal {
+        uint256 n = j - i;
+        uint256[] memory bases = new uint256[](n);
+        uint256[] memory fracRems = new uint256[](n);
+        uint256 totalBase;
+
+        for (uint256 k = i; k < j; ++k) {
+            uint256 idx = k - i;
+            uint256 q = forBids
+                ? bidsRevealed[k].quantity
+                : offersRevealed[k].quantity;
+            bases[idx] = Math.mulDiv(rem, q, sumQty);
+            fracRems[idx] = mulmod(rem, q, sumQty);
+            totalBase += bases[idx];
         }
-        uint256 finalVolume = finalDemand < finalSupply
-            ? finalDemand
-            : finalSupply;
-        return (finalRate, finalVolume);
+
+        uint256 unitsLeft = rem - totalBase;
+        for (uint256 u; u < unitsLeft; ++u) {
+            uint256 maxFrac;
+            address maxAddr;
+            uint256 maxIdx;
+            for (uint256 idx; idx < n; ++idx) {
+                address addr = forBids
+                    ? bidsRevealed[i + idx].bidder
+                    : offersRevealed[i + idx].offerer;
+                if (
+                    fracRems[idx] > maxFrac ||
+                    (fracRems[idx] == maxFrac &&
+                        uint160(addr) > uint160(maxAddr))
+                ) {
+                    maxFrac = fracRems[idx];
+                    maxAddr = addr;
+                    maxIdx = idx;
+                }
+            }
+            bases[maxIdx] += 1;
+            fracRems[maxIdx] = 0;
+        }
+
+        for (uint256 k = i; k < j; ++k) {
+            uint256 idx = k - i;
+            uint256 alloc = bases[idx];
+            if (forBids) {
+                finalBidAllocation[bidsRevealed[k].bidder] = alloc;
+                _finalizeBidAssignment(
+                    bidsRevealed[k].bidder,
+                    alloc,
+                    clearingRate
+                );
+            } else {
+                uint256 qFull = offersRevealed[k].quantity;
+                finalOfferAllocation[offersRevealed[k].offerer] = alloc;
+                _finalizeOfferAssignment(
+                    offersRevealed[k].offerer,
+                    alloc,
+                    qFull,
+                    clearingRate
+                );
+            }
+        }
     }
 
     // Assigning offers to bidders
@@ -609,7 +690,6 @@ contract AuctionEngine is ReentrancyGuard, Ownable {
         uint256 rem = totalCleared;
         uint256 len = bidsRevealed.length;
         for (uint256 i; i < len && rem > 0; ) {
-            if (bidsRevealed[i].rate.lt(clearingRate)) break;
             uint256 j = i + 1;
             while (j < len && bidsRevealed[j].rate.eq(bidsRevealed[i].rate))
                 ++j;
@@ -629,21 +709,7 @@ contract AuctionEngine is ReentrancyGuard, Ownable {
                     rem -= q;
                 }
             } else {
-                uint256 left = rem;
-                for (uint256 k = i; k < j; ++k) {
-                    uint256 q = bidsRevealed[k].quantity;
-                    uint256 alloc = (k < j - 1) ? (left * q) / sumQty : left;
-                    finalBidAllocation[bidsRevealed[k].bidder] = alloc;
-                    _finalizeBidAssignment(
-                        bidsRevealed[k].bidder,
-                        alloc,
-                        clearingRate
-                    );
-                    if (k < j - 1) {
-                        left -= alloc;
-                        sumQty -= q;
-                    }
-                }
+                _allocateLargestRemainder(rem, i, j, sumQty, clearingRate, true);
                 rem = 0;
             }
             i = j;
@@ -663,7 +729,6 @@ contract AuctionEngine is ReentrancyGuard, Ownable {
         uint256 rem = totalCleared;
         uint256 len = offersRevealed.length;
         for (uint256 i; i < len && rem > 0; ) {
-            if (offersRevealed[i].rate.gt(clearingRate)) break;
             uint256 j = i + 1;
             while (j < len && offersRevealed[j].rate.eq(offersRevealed[i].rate))
                 ++j;
@@ -685,22 +750,7 @@ contract AuctionEngine is ReentrancyGuard, Ownable {
                     rem -= q;
                 }
             } else {
-                uint256 left = rem;
-                for (uint256 k = i; k < j; ++k) {
-                    uint256 q = offersRevealed[k].quantity;
-                    uint256 alloc = (k < j - 1) ? (left * q) / sumQty : left;
-                    finalOfferAllocation[offersRevealed[k].offerer] = alloc;
-                    _finalizeOfferAssignment(
-                        offersRevealed[k].offerer,
-                        alloc,
-                        offersRevealed[k].quantity,
-                        clearingRate
-                    );
-                    if (k < j - 1) {
-                        left -= alloc;
-                        sumQty -= q;
-                    }
-                }
+                _allocateLargestRemainder(rem, i, j, sumQty, clearingRate, false);
                 rem = 0;
             }
             i = j;

@@ -46,6 +46,15 @@ contract BidManager is ReentrancyGuard, Ownable {
     uint256 private _bidCount;
     uint256 public constant MAX_COLLATERAL_TOKENS_PER_BID = 10;
 
+    uint256 public removalCutoffBuffer = 1 hours;
+    mapping(address => bool) public whitelistedBidders;
+    bool public whitelistEnabled;
+    uint256 public minimumCollateralRatio = 150e16;
+
+    event RemovalCutoffUpdated(uint256 newBuffer);
+    event WhitelistStatusChanged(bool enabled);
+    event BidderWhitelisted(address indexed bidder, bool status);
+
     event BidCreated(address indexed submitter, uint256 quantity);
     event BidCollateralUnlocked(
         address indexed bidder,
@@ -70,6 +79,45 @@ contract BidManager is ReentrancyGuard, Ownable {
     modifier onlyWhenActive() {
         require(!auctionEngine.paused(), "Auction paused");
         _;
+    }
+
+    modifier onlyWhitelistedOrOpen() {
+        require(
+            !whitelistEnabled || whitelistedBidders[msg.sender],
+            "Not whitelisted"
+        );
+        _;
+    }
+
+    function setRemovalCutoffBuffer(uint256 buffer) external onlyOwner {
+        require(buffer <= 24 hours, "Buffer too large");
+        removalCutoffBuffer = buffer;
+        emit RemovalCutoffUpdated(buffer);
+    }
+
+    function setWhitelistEnabled(bool enabled) external onlyOwner {
+        whitelistEnabled = enabled;
+        emit WhitelistStatusChanged(enabled);
+    }
+
+    function setWhitelistedBidder(address bidder, bool status) external onlyOwner {
+        whitelistedBidders[bidder] = status;
+        emit BidderWhitelisted(bidder, status);
+    }
+
+    function batchWhitelistBidders(
+        address[] calldata bidders,
+        bool status
+    ) external onlyOwner {
+        for (uint256 i = 0; i < bidders.length; i++) {
+            whitelistedBidders[bidders[i]] = status;
+            emit BidderWhitelisted(bidders[i], status);
+        }
+    }
+
+    function setMinimumCollateralRatio(uint256 ratio) external onlyOwner {
+        require(ratio >= 100e16, "Ratio must be >= 100%");
+        minimumCollateralRatio = ratio;
     }
 
     constructor(
@@ -105,7 +153,7 @@ contract BidManager is ReentrancyGuard, Ownable {
         address[] calldata collateralTokens,
         uint256[] calldata collateralAmounts,
         address baseToken
-    ) external nonReentrant onlyWhenActive {
+    ) external nonReentrant onlyWhenActive onlyWhitelistedOrOpen {
         require(baseToken == token, "Invalid token");
         require(
             collateralTokens.length == collateralAmounts.length,
@@ -147,6 +195,11 @@ contract BidManager is ReentrancyGuard, Ownable {
                 collateralAmounts
             ),
             "In initial shortfall"
+        );
+        _requireMinimumCollateralRatio(
+            bidAmount,
+            collateralTokens,
+            collateralAmounts
         );
 
         uint256 indexMarker = bidSubmitted[msg.sender];
@@ -228,6 +281,11 @@ contract BidManager is ReentrancyGuard, Ownable {
             auctionEngine.getAuctionPhase() ==
                 AuctionEngine.AuctionPhase.Bidding,
             "Cannot remove bid"
+        );
+        uint256 biddingEnd = auctionEngine.biddingEnd();
+        require(
+            block.timestamp + removalCutoffBuffer < biddingEnd,
+            "Removal window closed"
         );
         require(collateralLocked[msg.sender], "No locked collateral");
 
@@ -484,11 +542,29 @@ contract BidManager is ReentrancyGuard, Ownable {
         require(tokens.length == amounts.length, "len mismatch");
         require(bidSubmitted[msg.sender] > 0, "no active bid");
 
+        uint256 bidId = bidSubmitted[msg.sender];
+        EncryptedBid storage b = bids[bidId - 1];
+
         for (uint256 i; i < tokens.length; ++i) {
             require(collatMgr.isAcceptedCollateral(tokens[i]), "invalid token");
             require(amounts[i] > 0, "zero amt");
             collatMgr.lock(msg.sender, tokens[i], amounts[i]);
             emit ExternalCollateralLocked(msg.sender, tokens[i], amounts[i]);
+
+            bool exists = false;
+            for (uint256 j; j < b.collateralTokens.length; ++j) {
+                if (b.collateralTokens[j] == tokens[i]) {
+                    exists = true;
+                    break;
+                }
+            }
+            if (!exists) {
+                require(
+                    b.collateralTokens.length < MAX_COLLATERAL_TOKENS_PER_BID,
+                    "Too many collateral tokens"
+                );
+                b.collateralTokens.push(tokens[i]);
+            }
         }
     }
 
@@ -548,6 +624,30 @@ contract BidManager is ReentrancyGuard, Ownable {
             collatMgr.unlock(msg.sender, tokens[i], amounts[i]);
             emit ExternalCollateralUnlocked(msg.sender, tokens[i], amounts[i]);
         }
+    }
+
+    function _requireMinimumCollateralRatio(
+        uint256 bidAmount,
+        address[] calldata collateralTokens,
+        uint256[] calldata collateralAmounts
+    ) internal view {
+        uint256 bidWad = bidAmount.to18(tokenDecimals);
+        uint256 bidUSD = collatMgr.oracle().priceOfTokens(token, bidWad);
+        require(bidUSD > 0, "Invalid bid price");
+        uint256 totalCollateralUSD;
+        for (uint256 i = 0; i < collateralTokens.length; i++) {
+            if (collateralAmounts[i] == 0) continue;
+            uint8 decI = IERC20Metadata(collateralTokens[i]).decimals();
+            uint256 wadColl = collateralAmounts[i].to18(decI);
+            totalCollateralUSD += collatMgr.oracle().priceOfTokens(
+                collateralTokens[i],
+                wadColl
+            );
+        }
+        require(
+            totalCollateralUSD * 1e18 >= bidUSD * minimumCollateralRatio,
+            "Insufficient collateral ratio"
+        );
     }
 
     // Initial shortfall check

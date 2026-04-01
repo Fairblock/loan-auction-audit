@@ -5,6 +5,7 @@ import "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "./interface/IOracle.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 /* 
  * @title CollateralManager
@@ -18,6 +19,11 @@ contract CollateralManager is ReentrancyGuard, Ownable {
     event MaintenanceRatioSet(address indexed token, uint256 ratioBP);
     event ManagerSet(address manager);
     event CollateralTokenAdded(address token);
+    event CollateralCreditAccrued(
+        address indexed to,
+        address indexed token,
+        uint256 amount
+    );
 
     IOracle public oracle;
     address public manager;
@@ -27,6 +33,8 @@ contract CollateralManager is ReentrancyGuard, Ownable {
     address[] public acceptedCollateralTokens;
     mapping(address => bool) public isAcceptedCollateral;
     mapping(address => uint8) public tokenDecimals;
+    /// @notice Credited when direct ERC-20 transfer fails (user => token => amount).
+    mapping(address => mapping(address => uint256)) public claimable;
 
     constructor(address _oracle) Ownable(msg.sender) {
         require(_oracle != address(0), "Invalid oracle");
@@ -57,8 +65,8 @@ contract CollateralManager is ReentrancyGuard, Ownable {
     ) external onlyAuthorized nonReentrant {
         require(_locked[from][token] >= amount, "Insufficient locked");
         _locked[from][token] -= amount;
-        
-        IERC20(token).safeTransfer(to, amount);
+
+        _transferOrCredit(to, token, amount);
     }
 
     // View locked balance of a user for a specific token.
@@ -91,7 +99,7 @@ contract CollateralManager is ReentrancyGuard, Ownable {
     ) external onlyAuthorized nonReentrant {
         require(_locked[user][token] >= amount, "Insufficient locked");
         _locked[user][token] -= amount;
-        IERC20(token).safeTransfer(user, amount);
+        _transferOrCredit(user, token, amount);
         emit Unlocked(user, token, amount);
     }
 
@@ -139,5 +147,32 @@ contract CollateralManager is ReentrancyGuard, Ownable {
     function setOracle(address _oracle) external onlyOwner nonReentrant {
         require(_oracle != address(0), "Zero address");
         oracle = IOracle(_oracle);
+    }
+
+    /// @notice Pull collateral previously credited after a failed transfer.
+    function claim(address tokenAddr) external nonReentrant {
+        uint256 amt = claimable[msg.sender][tokenAddr];
+        require(amt > 0, "Nothing to claim");
+        claimable[msg.sender][tokenAddr] = 0;
+        IERC20(tokenAddr).safeTransfer(msg.sender, amt);
+    }
+
+    function _transferOrCredit(
+        address to,
+        address tokenAddr,
+        uint256 amount
+    ) internal {
+        if (amount == 0) return;
+        require(to != address(0), "Zero address");
+        IERC20 t = IERC20(tokenAddr);
+        try t.transfer(to, amount) returns (bool success) {
+            if (!success) {
+                claimable[to][tokenAddr] += amount;
+                emit CollateralCreditAccrued(to, tokenAddr, amount);
+            }
+        } catch {
+            claimable[to][tokenAddr] += amount;
+            emit CollateralCreditAccrued(to, tokenAddr, amount);
+        }
     }
 }

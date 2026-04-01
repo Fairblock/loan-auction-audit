@@ -16,6 +16,7 @@ contract LendingVault is Ownable, ReentrancyGuard {
 
     event FundsLocked(address indexed user, uint256 amount);
     event FundsUnlocked(address indexed user, uint256 amount);
+    event CreditAccrued(address indexed to, uint256 amount);
     event ManagerUpdated(
         address indexed oldManager,
         address indexed newManager
@@ -24,6 +25,8 @@ contract LendingVault is Ownable, ReentrancyGuard {
     address public token;
     address public manager;
     mapping(address => uint256) public locked;
+    /// @notice Purchase-token balance credited when direct transfer fails (e.g. blocked recipient).
+    mapping(address => uint256) public claimable;
     uint8   public tokenDecimals;
 
     constructor(address _token) Ownable(msg.sender) {
@@ -59,7 +62,7 @@ contract LendingVault is Ownable, ReentrancyGuard {
         require(locked[user] >= amountRaw, "Not locked");
 
         locked[user] -= amountRaw;
-        IERC20(token).safeTransfer(user, amountRaw);
+        _transferOrCredit(user, amountRaw);
         emit FundsUnlocked(user, amountRaw);
     }
 
@@ -78,7 +81,30 @@ contract LendingVault is Ownable, ReentrancyGuard {
         uint256 amountRaw
     ) external onlyManager nonReentrant {
         require(to != address(0), "Zero address");
-        IERC20(token).safeTransfer(to, amountRaw);
+        _transferOrCredit(to, amountRaw);
+    }
+
+    /// @notice Pull tokens previously credited after a failed transfer.
+    function claim() external nonReentrant {
+        uint256 amt = claimable[msg.sender];
+        require(amt > 0, "Nothing to claim");
+        claimable[msg.sender] = 0;
+        IERC20(token).safeTransfer(msg.sender, amt);
+    }
+
+    function _transferOrCredit(address to, uint256 amountRaw) internal {
+        if (amountRaw == 0) return;
+        require(to != address(0), "Zero address");
+        IERC20 t = IERC20(token);
+        try t.transfer(to, amountRaw) returns (bool success) {
+            if (!success) {
+                claimable[to] += amountRaw;
+                emit CreditAccrued(to, amountRaw);
+            }
+        } catch {
+            claimable[to] += amountRaw;
+            emit CreditAccrued(to, amountRaw);
+        }
     }
 
     // This function allows the owner to recover ERC20 tokens sent to the contract in case of trapped tokens.

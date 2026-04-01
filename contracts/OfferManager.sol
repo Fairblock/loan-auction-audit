@@ -27,6 +27,14 @@ contract OfferManager is Ownable, ReentrancyGuard {
     uint256 private _offerCount;
     uint256 public maxNumOffers;
 
+    uint256 public removalCutoffBuffer = 1 hours;
+    mapping(address => bool) public whitelistedLenders;
+    bool public whitelistEnabled;
+
+    event RemovalCutoffUpdated(uint256 newBuffer);
+    event WhitelistStatusChanged(bool enabled);
+    event LenderWhitelisted(address indexed lender, bool status);
+
     event OfferSubmitted(
         address indexed user,
         uint256 qty,
@@ -64,11 +72,46 @@ contract OfferManager is Ownable, ReentrancyGuard {
         require(!auctionEngine.paused(), "Auction paused");
         _;
     }
+
+    modifier onlyWhitelistedOrOpen() {
+        require(
+            !whitelistEnabled || whitelistedLenders[msg.sender],
+            "Not whitelisted"
+        );
+        _;
+    }
+
+    function setRemovalCutoffBuffer(uint256 buffer) external onlyOwner {
+        require(buffer <= 24 hours, "Buffer too large");
+        removalCutoffBuffer = buffer;
+        emit RemovalCutoffUpdated(buffer);
+    }
+
+    function setWhitelistEnabled(bool enabled) external onlyOwner {
+        whitelistEnabled = enabled;
+        emit WhitelistStatusChanged(enabled);
+    }
+
+    function setWhitelistedLender(address lender, bool status) external onlyOwner {
+        whitelistedLenders[lender] = status;
+        emit LenderWhitelisted(lender, status);
+    }
+
+    function batchWhitelistLenders(
+        address[] calldata lenders,
+        bool status
+    ) external onlyOwner {
+        for (uint256 i = 0; i < lenders.length; i++) {
+            whitelistedLenders[lenders[i]] = status;
+            emit LenderWhitelisted(lenders[i], status);
+        }
+    }
+
     // Submit an offer or update an existing one.
     function submitOffer(
         uint256 quantity,
         bytes calldata encryptedRate
-    ) external nonReentrant onlyWhenActive {
+    ) external nonReentrant onlyWhenActive onlyWhitelistedOrOpen {
         require(
             auctionEngine.getAuctionPhase() ==
                 AuctionEngine.AuctionPhase.Bidding,
@@ -137,6 +180,11 @@ contract OfferManager is Ownable, ReentrancyGuard {
             auctionEngine.getAuctionPhase() ==
                 AuctionEngine.AuctionPhase.Bidding,
             "Cannot remove offer"
+        );
+        uint256 biddingEnd = auctionEngine.biddingEnd();
+        require(
+            block.timestamp + removalCutoffBuffer < biddingEnd,
+            "Removal window closed"
         );
         uint256 amt = lockedOfferFunds[msg.sender];
         require(amt > 0, "No locked funds");
