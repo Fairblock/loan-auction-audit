@@ -44,6 +44,7 @@ contract BidManager is ReentrancyGuard, Ownable {
     uint8 public tokenDecimals;
     uint256 public maxNumBids;
     uint256 private _bidCount;
+    uint256 public constant MAX_COLLATERAL_TOKENS_PER_BID = 10;
 
     event BidCreated(address indexed submitter, uint256 quantity);
     event BidCollateralUnlocked(
@@ -110,7 +111,11 @@ contract BidManager is ReentrancyGuard, Ownable {
             collateralTokens.length == collateralAmounts.length,
             "Mismatched input lengths"
         );
-
+        require(encryptedRate.length > 0 && encryptedRate.length <= 256, "invalid encryptedRate size");
+        require(
+            collateralTokens.length > 0 && collateralTokens.length <= MAX_COLLATERAL_TOKENS_PER_BID,
+            "Too many collateral tokens"
+        );
         for (uint256 i = 0; i < collateralTokens.length; i++) {
             string memory sym = IERC20Metadata(collateralTokens[i]).symbol();
             for (uint256 j = 0; j < i; j++) {
@@ -241,7 +246,18 @@ contract BidManager is ReentrancyGuard, Ownable {
             }
         }
         collateralLocked[msg.sender] = false;
-        delete bids[index - 1];
+
+        uint256 lastIndex = _bidIndex - 1;
+        uint256 removeIndex = index - 1;
+        if (removeIndex != lastIndex) {
+            EncryptedBid storage lastBid = bids[lastIndex];
+            bids[removeIndex] = lastBid;
+            bidSubmitted[lastBid.submitter] = removeIndex + 1;
+        }
+        delete bids[lastIndex];
+        unchecked {
+            --_bidIndex;
+        }
         _bidCount--;
         bidSubmitted[msg.sender] = 0;
     }
@@ -268,6 +284,8 @@ contract BidManager is ReentrancyGuard, Ownable {
             }
         }
         collateralLocked[borrower] = false;
+
+        // In-place delete only: keeps _bidIndex stable for decryptBidsBatch / bidsDecrypted.
         delete bids[index - 1];
         _bidCount--;
         bidSubmitted[borrower] = 0;
@@ -311,15 +329,9 @@ contract BidManager is ReentrancyGuard, Ownable {
 
     // View all bids
     function getBids() external view returns (EncryptedBid[] memory) {
-        EncryptedBid[] memory activeBids = new EncryptedBid[](_bidCount);
-        uint256 j;
+        EncryptedBid[] memory activeBids = new EncryptedBid[](_bidIndex);
         for (uint256 i = 0; i < _bidIndex; i++) {
-            if (bids[i].submitter != address(0)) {
-                activeBids[j] = bids[i];
-                unchecked {
-                    ++j;
-                }
-            }
+            activeBids[i] = bids[i];
         }
         return activeBids;
     }
@@ -365,24 +377,25 @@ contract BidManager is ReentrancyGuard, Ownable {
         uint256 liquidatorfeeRate,
         uint256 protocolFeeRate
     ) external view returns (uint256 netCollateral, uint256 feeCollateral) {
+        uint256 coveragePaidWad = coveragePaid.to18(tokenDecimals);
         uint256 purchaseUsdValue = collatMgr.oracle().priceOfTokens(
             token,
-            coveragePaid
+            coveragePaidWad
         );
 
         uint8 collDec = IERC20Metadata(collateralToken).decimals();
-        uint256 oneToken = 10 ** collDec;
         uint256 oneCollateralUsd = collatMgr.oracle().priceOfTokens(
             collateralToken,
-            oneToken
+            1e18
         );
         require(oneCollateralUsd > 0, "Invalid collateral price");
 
-        uint256 rawCollateral = Math.mulDiv(
+        uint256 collateralWad = Math.mulDiv(
             purchaseUsdValue,
-            oneToken,
+            1e18,
             oneCollateralUsd
         );
+        uint256 rawCollateral = collateralWad.from18(collDec);
 
         uint256 liquidatorBonus = Math.mulDiv(
             rawCollateral,
@@ -431,32 +444,35 @@ contract BidManager is ReentrancyGuard, Ownable {
         nonReentrant
         onlyWhenActive
     {
-        for (uint256 i = 0; i < _bidIndex; i++) {
-            EncryptedBid memory bidEntry = bids[i];
-            if (bidEntry.submitter != address(0)) {
-                for (uint256 j = 0; j < bidEntry.collateralTokens.length; j++) {
-                    uint256 lockedAmt = collatMgr.lockedBalance(
-                        bidEntry.submitter,
-                        bidEntry.collateralTokens[j]
+        while (_bidIndex > 0) {
+            uint256 last = _bidIndex - 1;
+            EncryptedBid memory bidEntry = bids[last];
+            address sub = bidEntry.submitter;
+            for (uint256 j = 0; j < bidEntry.collateralTokens.length; j++) {
+                uint256 lockedAmt = collatMgr.lockedBalance(
+                    sub,
+                    bidEntry.collateralTokens[j]
+                );
+                if (lockedAmt > 0) {
+                    collatMgr.unlock(
+                        sub,
+                        bidEntry.collateralTokens[j],
+                        lockedAmt
                     );
-                    if (lockedAmt > 0) {
-                        collatMgr.unlock(
-                            bidEntry.submitter,
-                            bidEntry.collateralTokens[j],
-                            lockedAmt
-                        );
-                        emit BidCollateralUnlocked(
-                            bidEntry.submitter,
-                            bidEntry.collateralTokens[j],
-                            lockedAmt
-                        );
-                    }
+                    emit BidCollateralUnlocked(
+                        sub,
+                        bidEntry.collateralTokens[j],
+                        lockedAmt
+                    );
                 }
-                collateralLocked[bidEntry.submitter] = false;
-                delete bids[bidSubmitted[bidEntry.submitter] - 1];
-                _bidCount--;
-                bidSubmitted[bidEntry.submitter] = 0;
             }
+            collateralLocked[sub] = false;
+            bidSubmitted[sub] = 0;
+            delete bids[last];
+            unchecked {
+                --_bidIndex;
+            }
+            _bidCount--;
         }
     }
 
@@ -485,6 +501,14 @@ contract BidManager is ReentrancyGuard, Ownable {
         uint256 bidId = bidSubmitted[msg.sender];
         require(bidId > 0, "no active bid");
 
+        AuctionEngine.AuctionPhase ph = auctionEngine.getAuctionPhase();
+        require(
+            ph == AuctionEngine.AuctionPhase.LoanWindow ||
+                ph == AuctionEngine.AuctionPhase.Repayment,
+            "unlock not allowed"
+        );
+        require(auctionEngine.isFinalized(), "not finalized");
+
         for (uint256 i; i < tokens.length; ++i) {
             require(amounts[i] > 0, "zero amt");
             require(
@@ -494,7 +518,7 @@ contract BidManager is ReentrancyGuard, Ownable {
         }
 
         address[] memory all = bids[bidId - 1].collateralTokens;
-        uint256 postTotalRaw;
+        uint256 postHaircutUSD;
         for (uint256 i; i < all.length; ++i) {
             uint256 balRaw = collatMgr.collateralBalanceOf(msg.sender, all[i]);
             for (uint256 j; j < tokens.length; ++j) {
@@ -503,15 +527,21 @@ contract BidManager is ReentrancyGuard, Ownable {
                     break;
                 }
             }
-            if (balRaw > 0) {
-                postTotalRaw += balRaw;
-            }
+            if (balRaw == 0) continue;
+
+            uint8 decI = IERC20Metadata(all[i]).decimals();
+            uint256 wadAmt = balRaw.to18(decI);
+            uint256 rawUSD = collatMgr.oracle().priceOfTokens(all[i], wadAmt);
+            uint256 ratio = collatMgr.maintenanceRatios(all[i]);
+            if (ratio == 0) continue;
+            postHaircutUSD += rawUSD.mulDiv(1, ratio);
         }
 
-        uint256 owedWad = auctionEngine.repayments(msg.sender);
-        if (owedWad > 0) {
-            uint256 owedRaw = owedWad / (10 ** tokenDecimals);
-            require(postTotalRaw >= owedRaw, "would breach maintenance");
+        uint256 owedRaw = auctionEngine.repayments(msg.sender);
+        if (owedRaw > 0) {
+            uint256 owedWad = owedRaw.to18(tokenDecimals);
+            uint256 owedUsd = collatMgr.oracle().priceOfTokens(token, owedWad);
+            require(postHaircutUSD >= owedUsd, "would breach maintenance");
         }
 
         for (uint256 i; i < tokens.length; ++i) {

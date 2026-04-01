@@ -4,6 +4,7 @@ pragma solidity ^0.8.18;
 import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/utils/math/Math.sol";
 import "./AuctionEngine.sol";
 /* 
  * @title AuctionToken
@@ -44,14 +45,16 @@ contract AuctionToken is ERC20, Ownable, ReentrancyGuard {
 
         uint256 supplyRaw = totalSupply();
         uint256 repayedRaw = auction.totalRepayed();
+        uint256 atAmount = auction.auctionTokenAmount();
+        uint256 repaidInAT = Math.mulDiv(repayedRaw, 1e18, atAmount);
 
-        if (supplyRaw <= repayedRaw) {
+        if (supplyRaw <= repaidInAT) {
             _burn(msg.sender, amountRaw);
             auction.auctionTokenRedeem(msg.sender, amountRaw);
         } else {
-            uint256 burnAmountRaw = (amountRaw * repayedRaw) / supplyRaw;
+            uint256 redeemAT = Math.mulDiv(amountRaw, repaidInAT, supplyRaw);
             _burn(msg.sender, amountRaw);
-            auction.auctionTokenRedeem(msg.sender, burnAmountRaw);
+            auction.auctionTokenRedeem(msg.sender, redeemAT);
         }
     }
 

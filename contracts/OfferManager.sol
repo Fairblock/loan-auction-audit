@@ -143,21 +143,28 @@ contract OfferManager is Ownable, ReentrancyGuard {
 
         lockedOfferFunds[msg.sender] = 0;
         lendingVault.unlockFunds(msg.sender, amt);
-        delete offers[offerSubmitted[msg.sender] - 1];
-        offerSubmitted[msg.sender] = 0;
+
+        uint256 index = offerSubmitted[msg.sender];
+        uint256 lastIndex = _offerIndex - 1;
+        uint256 removeIndex = index - 1;
+        if (removeIndex != lastIndex) {
+            EncryptedOffer storage lastOffer = offers[lastIndex];
+            offers[removeIndex] = lastOffer;
+            offerSubmitted[lastOffer.submitter] = removeIndex + 1;
+        }
+        delete offers[lastIndex];
+        unchecked {
+            --_offerIndex;
+        }
         _offerCount--;
+        offerSubmitted[msg.sender] = 0;
         emit OfferFundsUnlocked(msg.sender, amt);
     }
     // Get all offers
     function getOffers() external view returns (EncryptedOffer[] memory) {
-        EncryptedOffer[] memory offersList = new EncryptedOffer[](_offerCount);
-        uint256 index = 0;
+        EncryptedOffer[] memory offersList = new EncryptedOffer[](_offerIndex);
         for (uint256 i = 0; i < _offerIndex; i++) {
-            if (offers[i].submitter == address(0)) {
-                continue;
-            }
-            offersList[index] = offers[i];
-            index++;
+            offersList[i] = offers[i];
         }
         return offersList;
     }
@@ -176,21 +183,22 @@ contract OfferManager is Ownable, ReentrancyGuard {
         nonReentrant
         onlyWhenActive
     {
-        for (uint256 i = 0; i < _offerIndex; i++) {
-            EncryptedOffer memory offer = offers[i];
-            if (offer.submitter != address(0)) {
-                uint256 amt = lockedOfferFunds[offer.submitter];
-                if (amt > 0) {
-                    lockedOfferFunds[offer.submitter] = 0;
-                    lendingVault.unlockFunds(offer.submitter, amt);
-                    emit OfferFundsUnlocked(offer.submitter, amt);
-                }
-
-                delete offers[i];
-                offerSubmitted[offer.submitter] = 0;
+        while (_offerIndex > 0) {
+            uint256 last = _offerIndex - 1;
+            EncryptedOffer memory offer = offers[last];
+            address sub = offer.submitter;
+            uint256 amt = lockedOfferFunds[sub];
+            if (amt > 0) {
+                lockedOfferFunds[sub] = 0;
+                lendingVault.unlockFunds(sub, amt);
+                emit OfferFundsUnlocked(sub, amt);
             }
+            offerSubmitted[sub] = 0;
+            delete offers[last];
+            unchecked {
+                --_offerIndex;
+            }
+            _offerCount--;
         }
-        _offerIndex = 0;
-        _offerCount = 0;
     }
 }

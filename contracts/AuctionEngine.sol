@@ -4,6 +4,7 @@ pragma solidity >=0.8.19;
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
 import "./OfferManager.sol";
+import "./LendingVault.sol";
 import "./interface/IDecrypter.sol";
 import "./BidManager.sol";
 import "./AuctionToken.sol";
@@ -131,7 +132,19 @@ contract AuctionEngine is ReentrancyGuard, Ownable {
             _bidManager != address(0) && _offerManager != address(0),
             "Zero address"
         );
-        bidManager = BidManager(_bidManager);
+        BidManager bm = BidManager(_bidManager);
+        require(
+            bm.token() == address(repaymentToken) &&
+                bm.tokenDecimals() == repaymentDecimals,
+            "Manager token mismatch"
+        );
+        LendingVault vault = OfferManager(_offerManager).lendingVault();
+        require(
+            vault.token() == address(repaymentToken) &&
+                vault.tokenDecimals() == repaymentDecimals,
+            "Vault token mismatch"
+        );
+        bidManager = bm;
         offerManager = OfferManager(_offerManager);
     }
 
@@ -164,10 +177,7 @@ contract AuctionEngine is ReentrancyGuard, Ownable {
                 processed++;
                 continue;
             }
-            uint8[] memory out = decrypter.decrypt(
-                _toUint8Array(encBids[i].encryptedRate),
-                decryptionKey
-            );
+            uint8[] memory out; try decrypter.decrypt(_toUint8Array(encBids[i].encryptedRate), decryptionKey) returns (uint8[] memory r) { out = r; } catch { bidsDecrypted++; processed++; bidManager.unlockCollateral(encBids[i].submitter); continue; }
             bool valid = true;
             for (uint256 k; k < out.length; ++k) {
                 if (out[k] < 48 || out[k] > 57) {
@@ -181,7 +191,9 @@ contract AuctionEngine is ReentrancyGuard, Ownable {
                 bidManager.unlockCollateral(encBids[i].submitter);
                 continue;
             }
+            if (out.length > 77) { bidsDecrypted++; processed++; bidManager.unlockCollateral(encBids[i].submitter); continue; }
             uint256 rawRate = _uint8ArrayToUint256(out);
+            if (rawRate > 20000) { bidsDecrypted++; processed++; bidManager.unlockCollateral(encBids[i].submitter); continue; }
             UD60x18 rate = ud(rawRate * 1e18);
             if (rate.gt(maxAllowedRate)) {
                 bidsDecrypted++;
@@ -216,10 +228,7 @@ contract AuctionEngine is ReentrancyGuard, Ownable {
                 offersDecrypted++;
                 continue;
             }
-            uint8[] memory out = decrypter.decrypt(
-                _toUint8Array(encOffers[i].encryptedRate),
-                decryptionKey
-            );
+            uint8[] memory out; try decrypter.decrypt(_toUint8Array(encOffers[i].encryptedRate), decryptionKey) returns (uint8[] memory r) { out = r; } catch { offersDecrypted++; processed++; offerManager.unlockFunds(encOffers[i].submitter, encOffers[i].quantity); continue; }
             bool valid = true;
             for (uint256 k; k < out.length; ++k) {
                 if (out[k] < 48 || out[k] > 57) {
@@ -236,7 +245,9 @@ contract AuctionEngine is ReentrancyGuard, Ownable {
                 );
                 continue;
             }
+            if (out.length > 77) { offersDecrypted++; processed++; offerManager.unlockFunds(encOffers[i].submitter, encOffers[i].quantity); continue; }
             uint256 rawRate = _uint8ArrayToUint256(out);
+            if (rawRate > 20000) { offersDecrypted++; processed++; offerManager.unlockFunds(encOffers[i].submitter, encOffers[i].quantity); continue; }
             UD60x18 rate = ud(rawRate * 1e18);
             if (rate.gt(maxAllowedRate)) {
                 offersDecrypted++;
@@ -363,10 +374,10 @@ contract AuctionEngine is ReentrancyGuard, Ownable {
 
         uint256 owed = repayments[participant];
         require(owed > 0, "No debt");
-        // require(
-        //     bidManager.isInShortFall(participant, owed),
-        //     "Not undercollateralized"
-        // );
+        require(
+            bidManager.isInShortFall(participant, owed),
+            "Not undercollateralized"
+        );
 
         uint256 totalCoverage;
         for (uint256 i; i < coverageAmounts.length; ++i)
@@ -375,7 +386,7 @@ contract AuctionEngine is ReentrancyGuard, Ownable {
 
         repayments[participant] = owed - totalCoverage;
         repaymentTotal -= totalCoverage;
-
+        totalRepayed += totalCoverage;
         repaymentToken.safeTransferFrom(
             msg.sender,
             address(offerManager.lendingVault()),
@@ -424,7 +435,7 @@ contract AuctionEngine is ReentrancyGuard, Ownable {
 
         repayments[participant] = owed - totalCoverage;
         repaymentTotal -= totalCoverage;
-        
+        totalRepayed += totalCoverage;
         repaymentToken.safeTransferFrom(
             msg.sender,
             address(offerManager.lendingVault()),
@@ -493,25 +504,43 @@ contract AuctionEngine is ReentrancyGuard, Ownable {
     // Internal sorting of bids from highest to lowest
     function _sortBids() internal {
         uint256 n = bidsRevealed.length;
-        for (uint256 i; i < n; ++i)
-            for (uint256 j; j < n - 1 - i; ++j)
-                if (bidsRevealed[j].rate.lt(bidsRevealed[j + 1].rate)) {
-                    DecodedBid memory tmp = bidsRevealed[j];
-                    bidsRevealed[j] = bidsRevealed[j + 1];
-                    bidsRevealed[j + 1] = tmp;
+        DecodedBid[] memory arr = new DecodedBid[](n);
+        for (uint256 i; i < n; ++i) {
+            arr[i] = bidsRevealed[i];
+        }
+        for (uint256 i; i < n; ++i) {
+            for (uint256 j; j < n - 1 - i; ++j) {
+                if (arr[j].rate.lt(arr[j + 1].rate)) {
+                    DecodedBid memory tmp = arr[j];
+                    arr[j] = arr[j + 1];
+                    arr[j + 1] = tmp;
                 }
+            }
+        }
+        for (uint256 k; k < n; ++k) {
+            bidsRevealed[k] = arr[k];
+        }
     }
 
     // Internal sorting of offers from lowest to highest
     function _sortOffers() internal {
         uint256 n = offersRevealed.length;
-        for (uint256 i; i < n; ++i)
-            for (uint256 j; j < n - 1 - i; ++j)
-                if (offersRevealed[j].rate.gt(offersRevealed[j + 1].rate)) {
-                    DecodedOffer memory tmp = offersRevealed[j];
-                    offersRevealed[j] = offersRevealed[j + 1];
-                    offersRevealed[j + 1] = tmp;
+        DecodedOffer[] memory arr = new DecodedOffer[](n);
+        for (uint256 i; i < n; ++i) {
+            arr[i] = offersRevealed[i];
+        }
+        for (uint256 i; i < n; ++i) {
+            for (uint256 j; j < n - 1 - i; ++j) {
+                if (arr[j].rate.gt(arr[j + 1].rate)) {
+                    DecodedOffer memory tmp = arr[j];
+                    arr[j] = arr[j + 1];
+                    arr[j + 1] = tmp;
                 }
+            }
+        }
+        for (uint256 k; k < n; ++k) {
+            offersRevealed[k] = arr[k];
+        }
     }
 
     // Calculating the clearing price
@@ -688,6 +717,7 @@ contract AuctionEngine is ReentrancyGuard, Ownable {
         uint256 quantityToken,
         UD60x18 clearingRate
     ) internal {
+        if (quantityToken == 0) return;
         UD60x18 scaledFactor = ud(100e18) + fraction.mul(clearingRate);
         UD60x18 repayFixedWad = ud(_to18(quantityToken)).mul(scaledFactor) /
             ud(100e18);
